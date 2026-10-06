@@ -1,0 +1,1944 @@
+---
+title: "Airbnb prices across European cities"
+author: "Jane Shadrina"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+This analysis studies Airbnb prices across European cities using listings,
+neighbourhood boundaries, and tourist amenities from OpenStreetMap. Listings
+are nested within neighbourhoods and cities.
+
+## Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  dpi = 300
+)
+
+options(
+  scipen = 999,
+  dplyr.summarise.inform = FALSE
+)
+```
+
+```{r packages}
+required_packages <- c(
+  "tidyverse",
+  "sf",
+  "osmdata",
+  "lme4",
+  "lmerTest",
+  "modelsummary",
+  "ggeffects",
+  "cowplot"
+)
+
+missing_packages <- setdiff(required_packages, rownames(installed.packages()))
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Install the missing packages before running the analysis: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+sf::sf_use_s2(FALSE)
+```
+
+## Configuration
+
+### Paths
+
+The data directory can be set with `AIRBNB_DATA_DIR`. Generated files stay in
+the local `outputs` directory.
+
+```{r paths}
+data_dir <- Sys.getenv(
+  "AIRBNB_DATA_DIR",
+  unset = file.path("..", "multievel database")
+)
+output_dir <- "outputs"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+### Cities
+
+```{r cities}
+all_cities <- c(
+  "london",
+  "madrid",
+  "amsterdam",
+  "barcelona",
+  "berlin",
+  "lisbon",
+  "paris",
+  "rome",
+  "venice",
+  "vienna"
+)
+
+analytic_cities <- c(
+  "london",
+  "madrid",
+  "amsterdam",
+  "berlin",
+  "rome",
+  "venice",
+  "vienna"
+)
+
+excluded_price_cities <- setdiff(all_cities, analytic_cities)
+
+message(
+  "Excluded because no usable listing-level price data were available: ",
+  paste(excluded_price_cities, collapse = ", ")
+)
+
+cities <- analytic_cities
+
+city_centres <- tibble::tribble(
+  ~city,        ~lon,      ~lat,
+  "london",     -0.1276,   51.5072,
+  "madrid",     -3.7038,   40.4168,
+  "amsterdam",   4.9041,   52.3676,
+  "berlin",     13.4050,   52.5200,
+  "rome",       12.4964,   41.9028,
+  "venice",     12.3155,   45.4408,
+  "vienna",     16.3738,   48.2082
+)
+```
+
+Barcelona, Lisbon, and Paris are excluded because the downloaded files do not
+contain usable nightly prices.
+
+### Currency
+
+London prices are converted from GBP using a fixed rate of 1.17 EUR.
+
+```{r currency}
+gbp_to_eur <- 1.17
+
+currency_conversion <- tibble::tribble(
+  ~city,        ~currency_to_eur,
+  "london",     gbp_to_eur,
+  "madrid",     1,
+  "amsterdam",  1,
+  "berlin",     1,
+  "rome",       1,
+  "venice",     1,
+  "vienna",     1
+)
+```
+
+## Input validation
+
+```{r validate-inputs}
+required_files <- tidyr::expand_grid(
+  city = cities,
+  file_type = c("listings", "neighbourhoods_geojson")
+) %>%
+  mutate(
+    path = case_when(
+      file_type == "listings" ~ file.path(data_dir, paste0("listings_", city, ".csv.gz")),
+      file_type == "neighbourhoods_geojson" ~ file.path(
+        data_dir,
+        paste0("neighbourhoods_", city, ".geojson")
+      )
+    ),
+    exists = file.exists(path)
+  )
+
+missing_files <- required_files %>%
+  filter(!exists)
+
+if (nrow(missing_files) > 0) {
+  print(missing_files)
+  stop("Some required files are missing or incorrectly named.")
+}
+```
+
+## Helper functions
+
+### Parsing
+
+```{r parsing-helpers}
+get_col <- function(df, colname, default = NA) {
+  if (colname %in% names(df)) {
+    df[[colname]]
+  } else {
+    rep(default, nrow(df))
+  }
+}
+
+parse_tf <- function(x) {
+  dplyr::case_when(
+    x %in% c(TRUE, "t", "T", "true", "TRUE", "1", 1) ~ 1,
+    x %in% c(FALSE, "f", "F", "false", "FALSE", "0", 0) ~ 0,
+    TRUE ~ NA_real_
+  )
+}
+
+parse_price <- function(x) {
+  readr::parse_number(
+    as.character(x),
+    locale = readr::locale(grouping_mark = ",", decimal_mark = ".")
+  )
+}
+```
+
+### Scaling and labels
+
+```{r transformation-helpers}
+median_safe <- function(x) {
+  m <- suppressWarnings(median(x, na.rm = TRUE))
+  ifelse(is.finite(m), m, 0)
+}
+
+z <- function(x) {
+  m <- mean(x, na.rm = TRUE)
+  s <- sd(x, na.rm = TRUE)
+
+  if (!is.finite(s) || s == 0) {
+    return(rep(0, length(x)))
+  }
+
+  as.numeric((x - m) / s)
+}
+
+clean_neighbourhood <- function(x) {
+  x %>%
+    as.character() %>%
+    stringr::str_squish()
+}
+
+```
+
+## Listing data
+
+### City reader
+
+```{r read-listings}
+read_city_listings <- function(city_name) {
+
+  path <- file.path(data_dir, paste0("listings_", city_name, ".csv.gz"))
+
+  message("Reading listings for: ", city_name)
+
+  x <- readr::read_csv(
+    path,
+    show_col_types = FALSE,
+    guess_max = 10000
+  )
+
+  bathroom_source <- if ("bathrooms" %in% names(x)) {
+    get_col(x, "bathrooms")
+  } else {
+    get_col(x, "bathrooms_text")
+  }
+
+  tibble(
+    city = city_name,
+    listing_id = as.character(get_col(x, "id")),
+    neighbourhood_original = clean_neighbourhood(get_col(x, "neighbourhood_cleansed")),
+    latitude = as.numeric(get_col(x, "latitude")),
+    longitude = as.numeric(get_col(x, "longitude")),
+
+    price_raw = parse_price(get_col(x, "price")),
+
+    room_type = stringr::str_squish(as.character(get_col(x, "room_type"))),
+    room_type_clean = stringr::str_to_lower(
+      stringr::str_squish(as.character(get_col(x, "room_type")))
+    ),
+
+    accommodates = as.numeric(get_col(x, "accommodates")),
+    bedrooms = as.numeric(get_col(x, "bedrooms")),
+    bathrooms = parse_price(bathroom_source),
+    beds = as.numeric(get_col(x, "beds")),
+
+    minimum_nights = as.numeric(get_col(x, "minimum_nights")),
+    availability_365 = as.numeric(get_col(x, "availability_365")),
+
+    number_of_reviews = as.numeric(get_col(x, "number_of_reviews")),
+    review_scores_rating = as.numeric(get_col(x, "review_scores_rating")),
+
+    host_is_superhost = parse_tf(get_col(x, "host_is_superhost")),
+    instant_bookable = parse_tf(get_col(x, "instant_bookable"))
+  )
+}
+```
+
+### Combined listing table
+
+```{r combine-listings}
+listings_raw <- purrr::map_dfr(cities, read_city_listings) %>%
+  left_join(currency_conversion, by = "city") %>%
+  mutate(
+    price_eur = price_raw * currency_to_eur
+  ) %>%
+  distinct(city, listing_id, .keep_all = TRUE)
+
+raw_city_counts <- listings_raw %>%
+  count(city, name = "raw_listings")
+
+print(raw_city_counts)
+
+listing_price_check <- listings_raw %>%
+  group_by(city) %>%
+  summarise(
+    raw_listings = n(),
+    usable_prices = sum(!is.na(price_eur) & price_eur > 0),
+    missing_prices = sum(is.na(price_eur)),
+    .groups = "drop"
+  )
+
+print(listing_price_check)
+
+if (any(listing_price_check$usable_prices == 0)) {
+  stop("At least one analytic city has no usable price values.")
+}
+
+
+```
+
+## Neighbourhood boundaries
+
+### Boundary reader
+
+```{r read-neighbourhoods}
+read_city_neighbourhood_shapes <- function(city_name) {
+
+  path <- file.path(data_dir, paste0("neighbourhoods_", city_name, ".geojson"))
+
+  message("Reading neighbourhood geometry for: ", city_name)
+
+  g <- sf::st_read(path, quiet = TRUE)
+
+  possible_name_cols <- c("neighbourhood", "neighbourhood_cleansed", "name")
+  name_col <- possible_name_cols[possible_name_cols %in% names(g)][1]
+
+  if (is.na(name_col)) {
+    stop("No neighbourhood name column found in: ", path)
+  }
+
+  g <- g %>%
+    mutate(
+      city = city_name,
+      geo_neighbourhood = clean_neighbourhood(.data[[name_col]])
+    ) %>%
+    filter(
+      !is.na(geo_neighbourhood),
+      geo_neighbourhood != ""
+    ) %>%
+    select(city, geo_neighbourhood, geometry)
+
+  g <- g %>%
+    sf::st_zm(drop = TRUE, what = "ZM") %>%
+    sf::st_make_valid()
+
+  g <- suppressWarnings(sf::st_collection_extract(g, "POLYGON"))
+  g <- g[!sf::st_is_empty(g), ]
+
+  sf::st_transform(g, 4326)
+}
+```
+
+### Combined boundary table
+
+```{r combine-neighbourhoods}
+neighbourhood_shapes <- purrr::map_dfr(cities, read_city_neighbourhood_shapes)
+
+
+```
+
+## Neighbourhood geography
+
+### Area and distance function
+
+```{r neighbourhood-geography}
+calculate_neighbourhood_metrics <- function(city_name) {
+
+  g <- neighbourhood_shapes %>%
+    filter(city == city_name)
+
+  g_proj <- sf::st_transform(g, 3035)
+
+  centre <- city_centres %>%
+    filter(city == city_name)
+
+  if (nrow(centre) != 1) {
+    stop("City centre not found for: ", city_name)
+  }
+
+  centre_sf <- sf::st_as_sf(
+    centre,
+    coords = c("lon", "lat"),
+    crs = 4326
+  ) %>%
+    sf::st_transform(3035)
+
+  g_proj <- g_proj %>%
+    mutate(
+      area_km2_piece = as.numeric(sf::st_area(geometry)) / 1000000,
+      dist_centre_km_piece = as.numeric(
+        sf::st_distance(
+          sf::st_point_on_surface(geometry),
+          centre_sf[1, ]
+        )
+      ) / 1000
+    )
+
+  g_proj %>%
+    sf::st_drop_geometry() %>%
+    group_by(city, geo_neighbourhood) %>%
+    summarise(
+      area_km2 = sum(area_km2_piece, na.rm = TRUE),
+      dist_centre_km = weighted.mean(
+        dist_centre_km_piece,
+        w = area_km2_piece,
+        na.rm = TRUE
+      ),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      dist_centre_km = if_else(is.nan(dist_centre_km), NA_real_, dist_centre_km)
+    )
+}
+```
+
+### Area and distance table
+
+```{r calculate-neighbourhood-geography}
+neighbourhood_geo <- purrr::map_dfr(cities, calculate_neighbourhood_metrics)
+
+print(
+  neighbourhood_geo %>%
+    group_by(city) %>%
+    summarise(
+      neighbourhoods_geo = n(),
+      missing_area = sum(is.na(area_km2)),
+      .groups = "drop"
+    )
+)
+
+
+```
+
+## Spatial matching
+
+Listings are matched to the polygon that contains them. The nearest polygon is
+used only when a point falls just outside all boundaries.
+
+### Assignment function
+
+```{r spatial-matching}
+listings_raw <- listings_raw %>%
+  mutate(row_id = row_number())
+
+assign_listing_neighbourhoods <- function(city_name) {
+
+  message("Spatially assigning listings for: ", city_name)
+
+  pts_df <- listings_raw %>%
+    filter(
+      city == city_name,
+      !is.na(longitude),
+      !is.na(latitude),
+      longitude >= -180,
+      longitude <= 180,
+      latitude >= -90,
+      latitude <= 90
+    )
+
+  shapes <- neighbourhood_shapes %>%
+    filter(city == city_name) %>%
+    select(geo_neighbourhood)
+
+  if (nrow(pts_df) == 0) {
+    warning("No valid listing coordinates for: ", city_name)
+    return(tibble(row_id = integer(), geo_neighbourhood = character()))
+  }
+
+  if (nrow(shapes) == 0) {
+    warning("No neighbourhood shapes for: ", city_name)
+    return(tibble(row_id = pts_df$row_id, geo_neighbourhood = NA_character_))
+  }
+
+  pts <- sf::st_as_sf(
+    pts_df,
+    coords = c("longitude", "latitude"),
+    crs = 4326,
+    remove = FALSE
+  )
+
+  joined <- sf::st_join(
+    pts,
+    shapes,
+    join = sf::st_within,
+    left = TRUE
+  )
+
+  joined_df <- joined %>%
+    sf::st_drop_geometry() %>%
+    group_by(row_id) %>%
+    summarise(
+      geo_neighbourhood = dplyr::first(
+        geo_neighbourhood[!is.na(geo_neighbourhood)],
+        default = NA_character_
+      ),
+      .groups = "drop"
+    )
+
+  unmatched <- joined_df %>%
+    filter(is.na(geo_neighbourhood))
+
+  if (nrow(unmatched) > 0) {
+
+    unmatched_pts <- pts %>%
+      filter(row_id %in% unmatched$row_id)
+
+    nearest_id <- sf::st_nearest_feature(unmatched_pts, shapes)
+
+    nearest_df <- tibble(
+      row_id = unmatched_pts$row_id,
+      geo_neighbourhood = shapes$geo_neighbourhood[nearest_id]
+    )
+
+    joined_df <- joined_df %>%
+      filter(!row_id %in% unmatched$row_id) %>%
+      bind_rows(nearest_df)
+  }
+
+  joined_df
+}
+```
+
+### Apply the spatial match
+
+```{r apply-spatial-matching}
+listing_geo_lookup <- purrr::map_dfr(cities, assign_listing_neighbourhoods)
+
+listings_raw_geo <- listings_raw %>%
+  left_join(listing_geo_lookup, by = "row_id")
+
+print(
+  listings_raw_geo %>%
+    group_by(city) %>%
+    summarise(
+      raw_listings = n(),
+      assigned_geo_neighbourhood = sum(!is.na(geo_neighbourhood)),
+      missing_geo_neighbourhood = sum(is.na(geo_neighbourhood)),
+      .groups = "drop"
+    )
+)
+
+
+```
+
+## OpenStreetMap amenities
+
+### Amenity groups
+
+```{r osm-configuration}
+osm_cache_dir <- file.path(output_dir, "osm_cache")
+dir.create(osm_cache_dir, recursive = TRUE, showWarnings = FALSE)
+
+osm_feature_groups <- list(
+  amenity = c(
+    "restaurant",
+    "cafe",
+    "bar",
+    "pub",
+    "fast_food",
+    "food_court",
+    "biergarten",
+    "theatre",
+    "cinema",
+    "nightclub"
+  ),
+  tourism = c(
+    "attraction",
+    "museum",
+    "gallery",
+    "viewpoint",
+    "artwork",
+    "zoo",
+    "aquarium"
+  ),
+  historic = c(
+    "monument",
+    "memorial",
+    "castle",
+    "archaeological_site"
+  )
+)
+
+empty_poi_sf <- function() {
+  sf::st_sf(
+    city = character(),
+    osm_id = character(),
+    osm_key = character(),
+    osm_value = character(),
+    osm_layer = character(),
+    geometry = sf::st_sfc(crs = 4326)
+  )
+}
+```
+
+### Geometry extraction
+
+```{r extract-osm-layer}
+extract_osm_layer <- function(osm_result, layer_name, city_name, osm_key) {
+
+  layer <- osm_result[[layer_name]]
+
+  if (is.null(layer) || nrow(layer) == 0) {
+    return(empty_poi_sf())
+  }
+
+  layer <- sf::st_transform(layer, 4326)
+
+  if (layer_name != "osm_points") {
+    layer <- suppressWarnings(sf::st_make_valid(layer))
+    sf::st_geometry(layer) <- suppressWarnings(
+      sf::st_point_on_surface(sf::st_geometry(layer))
+    )
+  }
+
+  if (!"osm_id" %in% names(layer)) {
+    layer$osm_id <- NA_character_
+  }
+
+  if (osm_key %in% names(layer)) {
+    layer$osm_value <- as.character(layer[[osm_key]])
+  } else {
+    layer$osm_value <- NA_character_
+  }
+
+  layer$city <- city_name
+  layer$osm_key <- osm_key
+  layer$osm_layer <- layer_name
+
+  layer %>%
+    select(city, osm_id, osm_key, osm_value, osm_layer, geometry)
+}
+```
+
+### OSM query
+
+```{r download-osm-group}
+download_city_osm_group <- function(city_name, osm_key, osm_values) {
+
+  message("Downloading OSM group for ", city_name, ": ", osm_key)
+
+  city_shape <- neighbourhood_shapes %>%
+    filter(city == city_name) %>%
+    sf::st_transform(4326)
+
+  bbox <- sf::st_bbox(city_shape)
+
+  q <- osmdata::opq(
+    bbox = unname(c(
+      bbox["xmin"],
+      bbox["ymin"],
+      bbox["xmax"],
+      bbox["ymax"]
+    )),
+    timeout = 180
+  ) %>%
+    osmdata::add_osm_feature(
+      key = osm_key,
+      value = osm_values,
+      value_exact = TRUE
+    )
+
+  osm_result <- tryCatch(
+    osmdata::osmdata_sf(q),
+    error = function(e) {
+      warning(
+        "OSM download failed for ",
+        city_name,
+        " / ",
+        osm_key,
+        ": ",
+        conditionMessage(e)
+      )
+      return(NULL)
+    }
+  )
+
+  if (is.null(osm_result)) {
+    return(empty_poi_sf())
+  }
+
+  pois <- bind_rows(
+    extract_osm_layer(osm_result, "osm_points", city_name, osm_key),
+    extract_osm_layer(osm_result, "osm_polygons", city_name, osm_key),
+    extract_osm_layer(osm_result, "osm_multipolygons", city_name, osm_key)
+  )
+
+  if (nrow(pois) == 0) {
+    return(empty_poi_sf())
+  }
+
+  pois
+}
+```
+
+### City cache
+
+```{r download-city-osm}
+download_city_osm_pois <- function(city_name) {
+
+  cache_path <- file.path(osm_cache_dir, paste0("osm_tourist_pois_", city_name, ".rds"))
+
+  if (file.exists(cache_path)) {
+    message("Reading cached OSM POIs for: ", city_name)
+    return(readRDS(cache_path))
+  }
+
+  message("Downloading OSM tourist POIs for: ", city_name)
+
+  city_pois <- purrr::imap_dfr(
+    osm_feature_groups,
+    ~download_city_osm_group(
+      city_name = city_name,
+      osm_key = .y,
+      osm_values = .x
+    )
+  )
+
+  if (nrow(city_pois) > 0) {
+    city_pois <- city_pois %>%
+      mutate(
+        osm_unique_id = case_when(
+          !is.na(osm_id) & osm_id != "" ~ paste(osm_key, osm_id, sep = ":"),
+          TRUE ~ paste(osm_key, osm_value, row_number(), sep = ":")
+        )
+      ) %>%
+      distinct(osm_unique_id, .keep_all = TRUE)
+  }
+
+  saveRDS(city_pois, cache_path)
+
+  city_pois
+}
+```
+
+### Combined amenity table
+
+```{r collect-osm-amenities}
+osm_tourist_pois <- purrr::map_dfr(cities, download_city_osm_pois)
+
+print(
+  osm_tourist_pois %>%
+    sf::st_drop_geometry() %>%
+    count(city, name = "tourist_pois")
+)
+
+
+```
+
+Amenities include food and nightlife venues, cultural attractions, and
+historic visitor sites. Polygon features are represented by a point on their
+surface before they are assigned to a neighbourhood.
+
+### Neighbourhood counts
+
+```{r neighbourhood-amenities}
+count_pois_by_city_neighbourhood <- function(city_name) {
+
+  message("Counting OSM POIs by neighbourhood for: ", city_name)
+
+  city_neighbourhoods <- neighbourhood_shapes %>%
+    filter(city == city_name) %>%
+    sf::st_transform(4326) %>%
+    select(geo_neighbourhood)
+
+  all_neighbourhoods <- city_neighbourhoods %>%
+    sf::st_drop_geometry() %>%
+    distinct(geo_neighbourhood) %>%
+    mutate(city = city_name)
+
+  city_pois <- osm_tourist_pois %>%
+    filter(city == city_name) %>%
+    sf::st_transform(4326)
+
+  if (nrow(city_pois) == 0) {
+    return(
+      all_neighbourhoods %>%
+        mutate(tourist_amenities = 0L)
+    )
+  }
+
+  joined <- sf::st_join(
+    city_pois,
+    city_neighbourhoods,
+    join = sf::st_intersects,
+    left = FALSE
+  )
+
+  if (nrow(joined) == 0) {
+    return(
+      all_neighbourhoods %>%
+        mutate(tourist_amenities = 0L)
+    )
+  }
+
+  counts <- joined %>%
+    sf::st_drop_geometry() %>%
+    distinct(osm_unique_id, geo_neighbourhood, .keep_all = TRUE) %>%
+    count(city, geo_neighbourhood, name = "tourist_amenities")
+
+  all_neighbourhoods %>%
+    left_join(counts, by = c("city", "geo_neighbourhood")) %>%
+    mutate(
+      tourist_amenities = replace_na(tourist_amenities, 0L)
+    )
+}
+```
+
+### Amenity density
+
+```{r calculate-neighbourhood-amenities}
+tourist_amenity_counts <- purrr::map_dfr(
+  cities,
+  count_pois_by_city_neighbourhood
+)
+
+tourist_amenity_context <- tourist_amenity_counts %>%
+  left_join(
+    neighbourhood_geo,
+    by = c("city", "geo_neighbourhood"),
+    relationship = "many-to-one"
+  ) %>%
+  mutate(
+    tourist_amenity_density = tourist_amenities / area_km2,
+    log_tourist_amenity_density = log1p(tourist_amenity_density)
+  ) %>%
+  select(
+    city,
+    geo_neighbourhood,
+    tourist_amenities,
+    tourist_amenity_density,
+    log_tourist_amenity_density
+  )
+
+print(
+  tourist_amenity_context %>%
+    group_by(city) %>%
+    summarise(
+      neighbourhoods = n(),
+      total_tourist_amenities = sum(tourist_amenities, na.rm = TRUE),
+      median_tourist_amenity_density = median(tourist_amenity_density, na.rm = TRUE),
+      .groups = "drop"
+    )
+)
+
+readr::write_csv(
+  tourist_amenity_context,
+  file.path(output_dir, "tourist_amenity_context.csv")
+)
+
+
+```
+
+## Neighbourhood context
+
+### Listing-level ingredients
+
+```{r neighbourhood-context}
+context_base <- listings_raw_geo %>%
+  filter(
+    !is.na(city),
+    !is.na(listing_id),
+    !is.na(geo_neighbourhood),
+    geo_neighbourhood != ""
+  ) %>%
+  mutate(
+    entire_home_context = if_else(room_type_clean == "entire home/apt", 1, 0),
+    number_of_reviews_context = replace_na(number_of_reviews, 0),
+    availability_context = replace_na(availability_365, 0)
+  )
+```
+
+### Neighbourhood aggregates
+
+```{r aggregate-neighbourhood-context}
+neighbourhood_context <- context_base %>%
+  group_by(city, geo_neighbourhood) %>%
+  summarise(
+    n_listings_all = n(),
+    n_entire_home_all = sum(entire_home_context, na.rm = TRUE),
+    sum_reviews_all = sum(number_of_reviews_context, na.rm = TRUE),
+    sum_availability_all = sum(availability_context, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    neighbourhood_geo,
+    by = c("city", "geo_neighbourhood"),
+    relationship = "many-to-one"
+  ) %>%
+  left_join(
+    tourist_amenity_context,
+    by = c("city", "geo_neighbourhood"),
+    relationship = "many-to-one"
+  ) %>%
+  mutate(
+    tourist_amenities = replace_na(tourist_amenities, 0L),
+    tourist_amenity_density = replace_na(tourist_amenity_density, 0),
+    log_tourist_amenity_density = replace_na(log_tourist_amenity_density, 0),
+
+    listing_density_all = n_listings_all / area_km2,
+    share_entire_home_all = n_entire_home_all / n_listings_all,
+    mean_reviews_all = sum_reviews_all / n_listings_all,
+    mean_availability_all = sum_availability_all / n_listings_all
+  )
+
+print(
+  neighbourhood_context %>%
+    group_by(city) %>%
+    summarise(
+      neighbourhoods = n(),
+      missing_area = sum(is.na(area_km2)),
+      missing_tourist_amenity_density = sum(is.na(tourist_amenity_density)),
+      .groups = "drop"
+    )
+)
+
+
+```
+
+## Analysis sample
+
+### Listing-level cleaning
+
+```{r clean-listings}
+model_base <- listings_raw_geo %>%
+  mutate(
+    entire_home = case_when(
+      room_type_clean == "entire home/apt" ~ 1,
+      room_type_clean == "private room" ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  filter(
+    !is.na(price_eur),
+    price_eur > 0,
+    !is.na(geo_neighbourhood),
+    geo_neighbourhood != "",
+    !is.na(city),
+    !is.na(entire_home)
+  ) %>%
+  group_by(city) %>%
+  mutate(
+    price_p01 = quantile(price_eur, 0.01, na.rm = TRUE),
+    price_p99 = quantile(price_eur, 0.99, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  filter(
+    price_eur >= price_p01,
+    price_eur <= price_p99
+  ) %>%
+  select(-price_p01, -price_p99) %>%
+  group_by(city) %>%
+  mutate(
+    accommodates = replace_na(accommodates, median_safe(accommodates)),
+    bedrooms = replace_na(bedrooms, median_safe(bedrooms)),
+    bathrooms = replace_na(bathrooms, median_safe(bathrooms)),
+    beds = replace_na(beds, median_safe(beds)),
+    minimum_nights = replace_na(minimum_nights, median_safe(minimum_nights)),
+    availability_365 = replace_na(availability_365, median_safe(availability_365)),
+
+    review_missing = if_else(is.na(review_scores_rating), 1, 0),
+    review_scores_rating = replace_na(
+      review_scores_rating,
+      median_safe(review_scores_rating)
+    ),
+
+    number_of_reviews = replace_na(number_of_reviews, 0),
+    host_is_superhost = replace_na(host_is_superhost, 0),
+    instant_bookable = replace_na(instant_bookable, 0)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    log_price = log(price_eur),
+    log_reviews = log1p(number_of_reviews),
+    log_minimum_nights = log1p(minimum_nights)
+  )
+
+
+```
+
+### Leave-one-out context
+
+```{r leave-one-out-context}
+model_data <- model_base %>%
+  left_join(
+    neighbourhood_context,
+    by = c("city", "geo_neighbourhood"),
+    relationship = "many-to-one"
+  ) %>%
+  mutate(
+    n_other_listings = n_listings_all - 1,
+
+    density_loo = if_else(
+      n_other_listings > 0,
+      n_other_listings / area_km2,
+      NA_real_
+    ),
+
+    share_entire_home_loo = if_else(
+      n_other_listings > 0,
+      (n_entire_home_all - entire_home) / n_other_listings,
+      NA_real_
+    ),
+
+    mean_reviews_loo = if_else(
+      n_other_listings > 0,
+      (sum_reviews_all - number_of_reviews) / n_other_listings,
+      NA_real_
+    ),
+
+    mean_availability_loo = if_else(
+      n_other_listings > 0,
+      (sum_availability_all - availability_365) / n_other_listings,
+      NA_real_
+    )
+  ) %>%
+  filter(
+    n_listings_all >= 20,
+    !is.na(area_km2),
+    area_km2 > 0,
+    !is.na(density_loo),
+    !is.na(dist_centre_km)
+  )
+```
+
+### Model variables
+
+Distance to the city centre is standardised within each city so that the
+measure remains comparable across differently sized cities.
+
+```{r build-model-data}
+model_data <- model_data %>%
+  mutate(
+    city = factor(city),
+    neighbourhood = geo_neighbourhood,
+    neighbourhood_id = factor(paste(city, geo_neighbourhood, sep = "__")),
+
+    accommodates_z = z(accommodates),
+    bedrooms_z = z(bedrooms),
+    bathrooms_z = z(bathrooms),
+    beds_z = z(beds),
+    rating_z = z(review_scores_rating),
+    log_reviews_z = z(log_reviews),
+    log_minimum_nights_z = z(log_minimum_nights),
+    availability_365_z = z(availability_365),
+
+    density_z = z(log1p(density_loo)),
+    share_entire_home_z = z(share_entire_home_loo),
+    mean_reviews_z = z(log1p(mean_reviews_loo)),
+    mean_availability_z = z(mean_availability_loo),
+    tourist_amenity_density_z = z(log_tourist_amenity_density)
+  ) %>%
+  group_by(city) %>%
+  mutate(
+    dist_centre_z = z(dist_centre_km)
+  ) %>%
+  ungroup() %>%
+  drop_na(
+    log_price,
+    entire_home,
+    accommodates_z,
+    bedrooms_z,
+    bathrooms_z,
+    rating_z,
+    log_reviews_z,
+    log_minimum_nights_z,
+    availability_365_z,
+    density_z,
+    share_entire_home_z,
+    mean_reviews_z,
+    mean_availability_z,
+    tourist_amenity_density_z,
+    dist_centre_z,
+    city,
+    neighbourhood_id
+  )
+
+
+```
+
+## Diagnostics
+
+### Sample flow
+
+```{r diagnostic-counts}
+diagnostic_raw <- listings_raw %>%
+  count(city, name = "raw")
+
+diagnostic_valid_coords <- listings_raw %>%
+  filter(
+    !is.na(longitude),
+    !is.na(latitude),
+    longitude >= -180,
+    longitude <= 180,
+    latitude >= -90,
+    latitude <= 90
+  ) %>%
+  count(city, name = "valid_coords")
+
+diagnostic_geo_assigned <- listings_raw_geo %>%
+  filter(!is.na(geo_neighbourhood)) %>%
+  count(city, name = "geo_assigned")
+
+diagnostic_context <- neighbourhood_context %>%
+  filter(!is.na(area_km2), area_km2 > 0) %>%
+  group_by(city) %>%
+  summarise(
+    context_neighbourhoods = n(),
+    context_listings = sum(n_listings_all, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+diagnostic_model_base <- model_base %>%
+  count(city, name = "model_base")
+
+diagnostic_model_data <- model_data %>%
+  count(city, name = "model_data")
+```
+
+```{r sample-flow}
+city_loss_diagnostic <- diagnostic_raw %>%
+  full_join(diagnostic_valid_coords, by = "city") %>%
+  full_join(diagnostic_geo_assigned, by = "city") %>%
+  full_join(diagnostic_context, by = "city") %>%
+  full_join(diagnostic_model_base, by = "city") %>%
+  full_join(diagnostic_model_data, by = "city") %>%
+  mutate(across(where(is.numeric), ~replace_na(.x, 0))) %>%
+  arrange(city)
+
+print(city_loss_diagnostic)
+
+readr::write_csv(
+  city_loss_diagnostic,
+  file.path(output_dir, "city_loss_diagnostic.csv")
+)
+```
+
+### Retention by city
+
+```{r city-retention}
+model_city_counts <- model_data %>%
+  count(city, name = "model_listings")
+
+city_retention <- raw_city_counts %>%
+  left_join(model_city_counts, by = "city") %>%
+  mutate(
+    model_listings = replace_na(model_listings, 0),
+    retained_share = model_listings / raw_listings
+  )
+
+print(city_retention)
+
+dropped_cities <- setdiff(cities, unique(as.character(model_data$city)))
+
+if (length(dropped_cities) > 0) {
+  warning(
+    "These analytic cities are absent from model_data: ",
+    paste(dropped_cities, collapse = ", ")
+  )
+}
+
+readr::write_csv(
+  model_data,
+  file.path(output_dir, "airbnb_multilevel_model_data_osm.csv")
+)
+
+
+```
+
+## Descriptive statistics
+
+### City summary
+
+```{r city-summary}
+city_summary <- model_data %>%
+  group_by(city) %>%
+  summarise(
+    listings = n(),
+    neighbourhoods = n_distinct(neighbourhood_id),
+    median_price_eur = median(price_eur, na.rm = TRUE),
+    mean_log_price = mean(log_price, na.rm = TRUE),
+    share_entire_home = mean(entire_home, na.rm = TRUE),
+    median_tourist_amenity_density = median(tourist_amenity_density, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(median_price_eur))
+
+print(city_summary)
+```
+
+### Neighbourhood summary
+
+```{r neighbourhood-summary}
+neighbourhood_summary <- model_data %>%
+  group_by(city, neighbourhood) %>%
+  summarise(
+    listings = n(),
+    median_price_eur = median(price_eur, na.rm = TRUE),
+    density = first(density_loo),
+    share_entire_home = first(share_entire_home_loo),
+    dist_centre_km = first(dist_centre_km),
+    tourist_amenities = first(tourist_amenities),
+    tourist_amenity_density = first(tourist_amenity_density),
+    .groups = "drop"
+  )
+
+print(head(neighbourhood_summary, 30))
+
+
+```
+
+## Exploratory plots
+
+### City prices
+
+```{r city-price-plot, fig.width=8, fig.height=5}
+city_price_plot_data <- model_data %>%
+  group_by(city) %>%
+  summarise(
+    median_price = median(price_eur, na.rm = TRUE),
+    p25 = quantile(price_eur, 0.25, na.rm = TRUE),
+    p75 = quantile(price_eur, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+plot_city_prices <- ggplot(
+  city_price_plot_data,
+  aes(y = forcats::fct_reorder(city, median_price), x = median_price)
+) +
+  geom_errorbarh(aes(xmin = p25, xmax = p75), height = 0.18) +
+  geom_point(size = 2) +
+  labs(
+    title = "Median Airbnb price by city",
+    subtitle = "Points show medians; bars show interquartile ranges",
+    x = "Nightly price, approximately EUR",
+    y = "City"
+  ) +
+  theme_minimal(base_size = 13)
+
+print(plot_city_prices)
+
+ggsave(
+  filename = file.path(output_dir, "plot_city_prices_clean.png"),
+  plot = plot_city_prices,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
+
+### Listing density
+
+```{r density-price-plot, fig.width=10, fig.height=6}
+plot_density_price <- ggplot(
+  neighbourhood_summary,
+  aes(x = log1p(density), y = median_price_eur)
+) +
+  geom_point(alpha = 0.45, size = 1.5) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.8) +
+  facet_wrap(~ city, scales = "free_y") +
+  labs(
+    title = "Neighbourhood Airbnb density and median nightly price",
+    x = "Log neighbourhood Airbnb density",
+    y = "Median nightly price, approximately EUR"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(plot_density_price)
+
+ggsave(
+  filename = file.path(output_dir, "plot_density_price_by_city.png"),
+  plot = plot_density_price,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
+```
+
+### Tourist amenity density
+
+```{r tourist-price-plot, fig.width=10, fig.height=6}
+plot_tourist_price <- ggplot(
+  neighbourhood_summary,
+  aes(x = log1p(tourist_amenity_density), y = median_price_eur)
+) +
+  geom_point(alpha = 0.45, size = 1.5) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.8) +
+  facet_wrap(~ city, scales = "free_y") +
+  labs(
+    title = "Tourist-amenity density and median Airbnb price",
+    x = "Log tourist-amenity density",
+    y = "Median nightly price, approximately EUR"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(plot_tourist_price)
+
+ggsave(
+  filename = file.path(output_dir, "plot_tourist_amenity_price_by_city.png"),
+  plot = plot_tourist_price,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
+
+
+```
+
+## Multilevel models
+
+### Optimizer
+
+```{r model-control}
+ctrl <- lmerControl(
+  optimizer = "bobyqa",
+  optCtrl = list(maxfun = 200000)
+)
+```
+
+### Empty model
+
+```{r empty-model}
+m0 <- lmer(
+  log_price ~ 1 +
+    (1 | city) +
+    (1 | neighbourhood_id),
+  data = model_data,
+  REML = FALSE,
+  control = ctrl
+)
+```
+
+### Listing controls
+
+```{r listing-model}
+m1 <- lmer(
+  log_price ~
+    entire_home +
+    accommodates_z +
+    bedrooms_z +
+    bathrooms_z +
+    rating_z +
+    review_missing +
+    log_reviews_z +
+    host_is_superhost +
+    instant_bookable +
+    log_minimum_nights_z +
+    availability_365_z +
+    (1 | city) +
+    (1 | neighbourhood_id),
+  data = model_data,
+  REML = FALSE,
+  control = ctrl
+)
+```
+
+### Neighbourhood context
+
+```{r context-model}
+m2 <- lmer(
+  log_price ~
+    entire_home +
+    accommodates_z +
+    bedrooms_z +
+    bathrooms_z +
+    rating_z +
+    review_missing +
+    log_reviews_z +
+    host_is_superhost +
+    instant_bookable +
+    log_minimum_nights_z +
+    availability_365_z +
+    density_z +
+    share_entire_home_z +
+    mean_reviews_z +
+    mean_availability_z +
+    tourist_amenity_density_z +
+    dist_centre_z +
+    (1 | city) +
+    (1 | neighbourhood_id),
+  data = model_data,
+  REML = FALSE,
+  control = ctrl
+)
+```
+
+### Random slope
+
+```{r random-slope-model}
+m3 <- lmer(
+  log_price ~
+    entire_home +
+    accommodates_z +
+    bedrooms_z +
+    bathrooms_z +
+    rating_z +
+    review_missing +
+    log_reviews_z +
+    host_is_superhost +
+    instant_bookable +
+    log_minimum_nights_z +
+    availability_365_z +
+    density_z +
+    share_entire_home_z +
+    mean_reviews_z +
+    mean_availability_z +
+    tourist_amenity_density_z +
+    dist_centre_z +
+    (1 | city) +
+    (1 + entire_home || neighbourhood_id),
+  data = model_data,
+  REML = FALSE,
+  control = ctrl
+)
+```
+
+### Cross-level interaction
+
+```{r interaction-model}
+m4 <- lmer(
+  log_price ~
+    entire_home * density_z +
+    accommodates_z +
+    bedrooms_z +
+    bathrooms_z +
+    rating_z +
+    review_missing +
+    log_reviews_z +
+    host_is_superhost +
+    instant_bookable +
+    log_minimum_nights_z +
+    availability_365_z +
+    share_entire_home_z +
+    mean_reviews_z +
+    mean_availability_z +
+    tourist_amenity_density_z +
+    dist_centre_z +
+    (1 | city) +
+    (1 | neighbourhood_id),
+  data = model_data,
+  REML = FALSE,
+  control = ctrl
+)
+```
+
+### Final ML specification
+
+```{r final-ml-model}
+m5 <- lmer(
+  log_price ~
+    entire_home * density_z +
+    accommodates_z +
+    bedrooms_z +
+    bathrooms_z +
+    rating_z +
+    review_missing +
+    log_reviews_z +
+    host_is_superhost +
+    instant_bookable +
+    log_minimum_nights_z +
+    availability_365_z +
+    share_entire_home_z +
+    mean_reviews_z +
+    mean_availability_z +
+    tourist_amenity_density_z +
+    dist_centre_z +
+    (1 | city) +
+    (1 + entire_home || neighbourhood_id),
+  data = model_data,
+  REML = FALSE,
+  control = ctrl
+)
+
+
+```
+
+### Model comparison
+
+```{r compare-models}
+summary(m0)
+summary(m1)
+summary(m2)
+summary(m3)
+summary(m4)
+summary(m5)
+
+anova(m0, m1, m2, m4)
+anova(m2, m3)
+anova(m3, m5)
+
+singularity_check <- tibble(
+  model = c("m0", "m1", "m2", "m3", "m4", "m5"),
+  singular = c(
+    isSingular(m0),
+    isSingular(m1),
+    isSingular(m2),
+    isSingular(m3),
+    isSingular(m4),
+    isSingular(m5)
+  )
+)
+
+print(singularity_check)
+
+
+```
+
+### Variance decomposition
+
+```{r variance-decomposition}
+variance_partition <- function(model) {
+  as.data.frame(VarCorr(model)) %>%
+    filter(is.na(var2)) %>%
+    transmute(
+      level = case_when(
+        grp == "Residual" ~ "Residual",
+        TRUE ~ paste(grp, var1)
+      ),
+      variance = vcov
+    ) %>%
+    mutate(
+      total_variance = sum(variance),
+      proportion = variance / total_variance
+    )
+}
+
+variance_reduction <- function(base_model, new_model) {
+  base <- variance_partition(base_model) %>%
+    select(level, base_variance = variance)
+
+  new <- variance_partition(new_model) %>%
+    select(level, new_variance = variance)
+
+  base %>%
+    inner_join(new, by = "level") %>%
+    mutate(
+      reduction = 1 - (new_variance / base_variance)
+    )
+}
+
+print(variance_partition(m0))
+print(variance_partition(m1))
+print(variance_partition(m2))
+print(variance_partition(m4))
+
+print(variance_reduction(m0, m1))
+print(variance_reduction(m1, m2))
+print(variance_reduction(m2, m4))
+
+
+```
+
+### Model table
+
+```{r model-table}
+models <- list(
+  "M0 Empty" = m0,
+  "M1 Listing controls" = m1,
+  "M2 Context + OSM" = m2,
+  "M3 Random slope + OSM" = m3,
+  "M4 Interaction + OSM" = m4,
+  "M5 Final + OSM" = m5
+)
+
+modelsummary(
+  models,
+  statistic = "({std.error})",
+  stars = TRUE,
+  output = "markdown"
+)
+
+modelsummary(
+  models,
+  statistic = "({std.error})",
+  stars = TRUE,
+  output = file.path(output_dir, "airbnb_model_table_osm.html")
+)
+
+
+```
+
+### Interaction effect
+
+```{r interaction-plot, fig.width=8, fig.height=5}
+interaction_predictions <- ggeffects::ggpredict(
+  m5,
+  terms = c("density_z [-2,-1,0,1,2]", "entire_home [0,1]")
+)
+
+interaction_df <- as.data.frame(interaction_predictions) %>%
+  mutate(
+    listing_type = case_when(
+      as.character(group) %in% c("0", "0.0") ~ "Private room",
+      as.character(group) %in% c("1", "1.0") ~ "Entire home/apartment",
+      TRUE ~ as.character(group)
+    )
+  )
+
+plot_interaction <- ggplot(
+  interaction_df,
+  aes(x = x, y = exp(predicted), linetype = listing_type)
+) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(
+    aes(
+      ymin = exp(conf.low),
+      ymax = exp(conf.high),
+      group = listing_type
+    ),
+    alpha = 0.15,
+    colour = NA
+  ) +
+  labs(
+    title = "Predicted Airbnb price by listing type and neighbourhood density",
+    subtitle = "Predictions from final OSM-enhanced multilevel model",
+    x = "Neighbourhood Airbnb density, standardized",
+    y = "Predicted nightly price, approximately EUR",
+    linetype = "Listing type"
+  ) +
+  theme_minimal(base_size = 13)
+
+print(plot_interaction)
+
+ggsave(
+  filename = file.path(output_dir, "plot_interaction_final_osm.png"),
+  plot = plot_interaction,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+
+```
+
+### City-level effects
+
+```{r city-effects, fig.width=8, fig.height=5}
+city_random_effects <- ranef(m0)$city %>%
+  rownames_to_column("city") %>%
+  rename(random_intercept = `(Intercept)`)
+
+plot_city_random_intercepts <- ggplot(
+  city_random_effects,
+  aes(x = random_intercept, y = forcats::fct_reorder(city, random_intercept))
+) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_point(size = 2) +
+  labs(
+    title = "City-level random intercepts from the empty model",
+    x = "City random intercept",
+    y = "City"
+  ) +
+  theme_minimal(base_size = 13)
+
+print(plot_city_random_intercepts)
+
+ggsave(
+  filename = file.path(output_dir, "plot_city_random_intercepts.png"),
+  plot = plot_city_random_intercepts,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+
+```
+
+### Final model
+
+```{r final-model}
+m_final_reml <- update(m5, REML = TRUE)
+
+summary(m_final_reml)
+variance_partition(m_final_reml)
+
+saveRDS(
+  m_final_reml,
+  file.path(output_dir, "m_final_reml_osm.rds")
+)
+
+fixed_effects <- fixef(m_final_reml)
+
+effect_interpretation <- tibble(
+  term = names(fixed_effects),
+  estimate_log_points = as.numeric(fixed_effects),
+  approximate_percent_change = 100 * (exp(estimate_log_points) - 1)
+)
+
+print(effect_interpretation)
+
+readr::write_csv(
+  effect_interpretation,
+  file.path(output_dir, "effect_interpretation_percent_changes_osm.csv")
+)
+
+
+```
+
+## Export
+
+The compact output tables are saved separately from the rendered report.
+
+```{r export-results}
+readr::write_csv(city_summary, file.path(output_dir, "city_summary_osm.csv"))
+readr::write_csv(neighbourhood_summary, file.path(output_dir, "neighbourhood_summary_osm.csv"))
+readr::write_csv(city_retention, file.path(output_dir, "city_retention_osm.csv"))
+readr::write_csv(singularity_check, file.path(output_dir, "singularity_check_osm.csv"))
+
+message("Analysis outputs saved to: ", output_dir)
+```
+
+## Publication figures
+
+### Shared style
+
+```{r publication-plot-setup}
+plot_dir <- file.path(output_dir, "figures")
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+city_order <- c(
+  "amsterdam",
+  "london",
+  "venice",
+  "rome",
+  "madrid",
+  "berlin",
+  "vienna"
+)
+
+city_labels <- c(
+  amsterdam = "Amsterdam",
+  london = "London",
+  venice = "Venice",
+  rome = "Rome",
+  madrid = "Madrid",
+  berlin = "Berlin",
+  vienna = "Vienna"
+)
+
+publication_plot_data <- neighbourhood_summary %>%
+  mutate(city = as.character(city)) %>%
+  filter(city %in% city_order)
+
+theme_city_minimal <- function(base_size = 10.5) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.title = element_text(
+        face = "bold",
+        size = base_size + 1.2,
+        hjust = 0.5,
+        margin = margin(b = 6)
+      ),
+      axis.title = element_blank(),
+      axis.text = element_text(size = base_size, colour = "grey20"),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(colour = "grey87", linewidth = 0.35),
+      plot.margin = margin(t = 6, r = 8, b = 6, l = 8)
+    )
+}
+
+line_blue <- "#3568A8"
+line_red <- "#9B3A3A"
+point_colour <- "grey55"
+band_colour <- "grey86"
+```
+
+### City panels
+
+```{r city-panel-function}
+make_city_panel <- function(
+  data,
+  city_name,
+  x_var,
+  line_colour,
+  x_limits = c(0, 8),
+  y_limits = c(0, 310),
+  x_breaks = c(0, 2, 4, 6, 8),
+  y_breaks = c(0, 100, 200, 300)
+) {
+
+  d <- data %>%
+    filter(city == city_name)
+
+  ggplot(d, aes(x = .data[[x_var]], y = median_price_eur)) +
+    geom_point(
+      size = 2.2,
+      alpha = 0.55,
+      colour = point_colour
+    ) +
+    geom_smooth(
+      method = "lm",
+      formula = y ~ x,
+      se = TRUE,
+      linewidth = 0.9,
+      colour = line_colour,
+      fill = band_colour
+    ) +
+    scale_x_continuous(
+      limits = x_limits,
+      breaks = x_breaks,
+      expand = expansion(mult = c(0.03, 0.03))
+    ) +
+    scale_y_continuous(
+      limits = y_limits,
+      breaks = y_breaks,
+      expand = expansion(mult = c(0.03, 0.03))
+    ) +
+    labs(title = city_labels[[city_name]]) +
+    theme_city_minimal()
+}
+```
+
+### Figure layout
+
+```{r horizontal-grid-function}
+make_horizontal_grid <- function(
+  plot_list,
+  x_label,
+  y_label,
+  save_path,
+  width = 14,
+  height = 8.2
+) {
+
+  blank_panel <- ggplot() + theme_void()
+
+  top_row <- cowplot::plot_grid(
+    plotlist = plot_list[1:4],
+    ncol = 4,
+    align = "hv"
+  )
+
+  bottom_row <- cowplot::plot_grid(
+    plotlist = c(plot_list[5:7], list(blank_panel)),
+    ncol = 4,
+    align = "hv"
+  )
+
+  full_grid <- cowplot::plot_grid(
+    top_row,
+    bottom_row,
+    ncol = 1,
+    rel_heights = c(1, 1)
+  )
+
+  final_plot <- cowplot::ggdraw() +
+    cowplot::draw_plot(full_grid, x = 0.055, y = 0.08, width = 0.93, height = 0.88) +
+    cowplot::draw_label(
+      x_label,
+      x = 0.53,
+      y = 0.02,
+      size = 13,
+      hjust = 0.5
+    ) +
+    cowplot::draw_label(
+      y_label,
+      x = 0.02,
+      y = 0.50,
+      size = 13,
+      angle = 90,
+      hjust = 0.5
+    )
+
+  print(final_plot)
+
+  ggsave(
+    filename = save_path,
+    plot = final_plot,
+    width = width,
+    height = height,
+    dpi = 300,
+    bg = "white"
+  )
+
+  invisible(final_plot)
+}
+```
+
+### Tourist amenities
+
+```{r tourist-amenity-figure, fig.width=14, fig.height=8.2}
+
+tourist_plot_data <- publication_plot_data %>%
+  mutate(log_tourist_amenity_density = log1p(tourist_amenity_density))
+
+tourist_panels <- lapply(
+  city_order,
+  function(city_name) {
+    make_city_panel(
+      data = tourist_plot_data,
+      city_name = city_name,
+      x_var = "log_tourist_amenity_density",
+      line_colour = line_blue
+    )
+  }
+)
+
+plot_tourist_horizontal <- make_horizontal_grid(
+  plot_list = tourist_panels,
+  x_label = "Log tourist-amenity density",
+  y_label = "Median nightly price, approximately EUR",
+  save_path = file.path(plot_dir, "figure_01_tourist_amenities_horizontal.png"),
+  width = 14,
+  height = 8.2
+)
+```
+
+### Airbnb density
+
+```{r airbnb-density-figure, fig.width=14, fig.height=8.2}
+
+density_plot_data <- publication_plot_data %>%
+  mutate(log_airbnb_density = log1p(density))
+
+density_panels <- lapply(
+  city_order,
+  function(city_name) {
+    make_city_panel(
+      data = density_plot_data,
+      city_name = city_name,
+      x_var = "log_airbnb_density",
+      line_colour = line_red
+    )
+  }
+)
+
+plot_density_horizontal <- make_horizontal_grid(
+  plot_list = density_panels,
+  x_label = "Log Airbnb listing density",
+  y_label = "Median nightly price, approximately EUR",
+  save_path = file.path(plot_dir, "figure_02_airbnb_density_horizontal.png"),
+  width = 14,
+  height = 8.2
+)
+
+message("Publication figures saved to: ", plot_dir)
+```
+
+## Package citations
+
+```{r package-citations}
+citation("sf")
+citation("osmdata")
+```
