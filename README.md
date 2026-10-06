@@ -14,7 +14,7 @@ neighbourhood-level context, and tourist amenities from OpenStreetMap.
 
 The raw data are not included in this repository. Set `AIRBNB_DATA_DIR` to a
 directory containing listing and neighbourhood files for Amsterdam, Berlin,
-London, Madrid, Rome, Venice, and Vienna:
+London, Madrid, Rome, Venice, and Vienna (get it here https://insideairbnb.com/get-the-data/):
 
 ```text
 listings_<city>.csv.gz
